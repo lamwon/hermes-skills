@@ -151,6 +151,19 @@ For Vercel production, set these in the dashboard.
 ## Pitfalls
 
 - **Format mismatch**: OpenAI format and Anthropic format have different request bodies AND different SSE response formats. Always handle both in separate functions.
-- **Stream cancellation**: When quota is exhausted (`429`/`402`), the stream body must be cancelled with `await res.body?.cancel()` to release the connection before making the next provider call. Failing to do this leaks connections.
+- **Stream cancellation**: When quota is exhausted (`429`/`402`), the stream body must be cancelled with `await res.body?.cancel()` to release the connection before making the next provider call. Failing to do this leaks connections — the process will hang waiting for the HTTP stream to close.
+- **SSE buffer handling — CRITICAL**: Do NOT clear the buffer after processing lines. SSE chunks can split a JSON line mid-way. Always preserve the incomplete line:
+  ```typescript
+  // ❌ WRONG: loses data when a JSON line is split across chunks
+  for (const line of buffer.split("\n")) { ... }
+  buffer = "";
+
+  // ✅ CORRECT: keep the last incomplete line for the next chunk
+  const lines = buffer.split("\n");
+  buffer = lines.pop() || "";  // ← this line is incomplete, save it
+  for (const line of lines) { ... }
+  ```
+  Without this, the first chunk's incomplete JSON gets discarded, causing random text loss and malformed JSON parse errors in the middle of responses.
 - **Frontend must handle unified SSE**: Both providers output `data: {"text":"..."}\n\n` chunks + `data: {"done":true}\n\n` terminator. The frontend reads SSE and accumulates text until `done`.
-- **Keep `tryOpenAI`/`tryAnthropic` pure**: Return `null` for quota failure, throw for actual errors, return `Response` for success. The cascade loop distinguishes these three cases.
+- **Keep `tryOpenAI`/`tryAnthropic` pure**: Return `null` for quota exhaustion (gets `await res.body?.cancel()`), throw for actual errors (HTTP 5xx, network failure), return `Response` for success. The cascade loop distinguishes exactly these three cases.
+- **Three-way cascade for production**: 1st = `/api/analyze` Next.js route (works on Vercel), 2nd = local proxy (works on dev machine), 3rd = mock data (works everywhere). Each layer tries before giving up. This prevents the entire site from going down when an API provider is unavailable.
